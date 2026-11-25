@@ -1,0 +1,220 @@
+name: GoFile → H.265 Converter
+
+on:
+  workflow_dispatch:
+    inputs:
+      gofile_input:
+        description: 'GoFile URL or content ID  (e.g. https://gofile.io/d/AbCdEf)'
+        required: true
+      convert_hevc:
+        description: 'Convert to H.265 / HEVC?'
+        type: boolean
+        default: true
+        required: true
+      crf:
+        description: 'CRF quality  (18=visually lossless · 28=default · 35=compact)'
+        default: '28'
+        required: false
+      upload_folder_id:
+        description: 'GoFile folder ID for upload  (blank = account root)'
+        default: ''
+        required: false
+
+jobs:
+  convert-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # hard cap: 6 h
+
+    steps:
+
+      # ── 1. Install tools ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg jq bc
+
+      # ── 2. Resolve GoFile URL → filename + direct download link ────────
+      - name: Resolve GoFile content
+        id: gf
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        run: |
+          RAW="${{ github.event.inputs.gofile_input }}"
+
+          # Strip to bare content ID
+          if [[ "$RAW" =~ /d/([A-Za-z0-9]+) ]]; then
+            CID="${BASH_REMATCH[1]}"
+          else
+            CID=$(echo "$RAW" | tr -d '[:space:]')
+          fi
+          echo "Content ID: $CID"
+
+          RESP=$(curl -sf \
+            "https://api.gofile.io/contents/${CID}?token=${GOFILE_TOKEN}&wt=4fd6sg89d7s6")
+          STATUS=$(echo "$RESP" | jq -r '.status')
+          [[ "$STATUS" == "ok" ]] || { echo "GoFile API error: $RESP"; exit 1; }
+
+          TYPE=$(echo "$RESP" | jq -r '.data.type')
+
+          if [[ "$TYPE" == "file" ]]; then
+            DL=$(echo "$RESP" | jq -r '.data.link')
+            FN=$(echo "$RESP" | jq -r '.data.name')
+          else
+            # Folder: grab first direct-child file
+            CHILD=$(echo "$RESP" \
+              | jq -r '.data.children | to_entries[]
+                        | select(.value.type=="file") | .value | @base64' \
+              | head -1 | base64 -d)
+            DL=$(echo "$CHILD" | jq -r '.link')
+            FN=$(echo "$CHILD" | jq -r '.name')
+          fi
+
+          echo "filename=$FN" >> $GITHUB_OUTPUT
+          echo "dl_url=$DL"   >> $GITHUB_OUTPUT
+          echo "→ $FN"
+
+      # ── 3. Download ────────────────────────────────────────────────────
+      - name: Download file
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        run: |
+          FN="${{ steps.gf.outputs.filename }}"
+          echo "⬇️  Downloading: $FN"
+          curl -L --progress-bar \
+            -H "Cookie: accountToken=${GOFILE_TOKEN}" \
+            "${{ steps.gf.outputs.dl_url }}" -o "$FN"
+          echo "WORKFILE=$FN" >> $GITHUB_ENV
+          echo "Size: $(du -sh "$FN" | cut -f1)"
+
+      # ── 4. Show source video info ──────────────────────────────────────
+      - name: Show source video info
+        run: |
+          echo "──────────────────────────────────────────"
+          ffprobe -v quiet -print_format json -show_streams "$WORKFILE" | jq -r '
+            .streams[] | select(.codec_type=="video") |
+            "Video  : \(.codec_name)  \(.width)x\(.height)  \(.r_frame_rate) fps",
+            "Bitrate: \(.bit_rate // "unknown") bps"
+          '
+          ffprobe -v quiet -print_format json -show_streams "$WORKFILE" | jq -r '
+            .streams[] | select(.codec_type=="audio") |
+            "Audio  : \(.codec_name)  \(.sample_rate)Hz  ch=\(.channels)"
+          '
+          DUR=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$WORKFILE")
+          DI=$(echo "$DUR / 1" | bc)
+          printf "Duration: %02dh %02dm %02ds\n" \
+            $((DI/3600)) $(((DI%3600)/60)) $((DI%60))
+          echo "──────────────────────────────────────────"
+
+      # ── 5. H.265 encode — fastest method ──────────────────────────────
+      #
+      #   libx265  preset=ultrafast  → all speed knobs at max:
+      #     bframes=0, me=dia, subme=0, rd=2, no-sao, no-weightp,
+      #     ref=1, early-skip, max-merge=1, no-scenecut, etc.
+      #   -threads 0   → uses every vCPU on the runner
+      #   -c:a copy    → audio pass-through (zero re-encode cost)
+      #   -movflags +faststart → web-friendly atom order
+      #
+      - name: Convert to H.265 (ultrafast)
+        if: ${{ github.event.inputs.convert_hevc == 'true' }}
+        run: |
+          IN="$WORKFILE"
+          OUT="${IN%.*}_hevc.mp4"
+          CRF="${{ github.event.inputs.crf }}"
+          PROG=/tmp/ff.prog
+
+          DUR=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$IN")
+          DI=$(echo "$DUR / 1" | bc)   # integer seconds
+
+          printf "🚀 Starting H.265 encode\n"
+          printf "   CRF=%s  preset=ultrafast  threads=all\n\n" "$CRF"
+
+          # ---- launch ffmpeg in background --------------------------------
+          ffmpeg -i "$IN" \
+            -c:v libx265 \
+            -preset ultrafast \
+            -crf "$CRF" \
+            -x265-params "log-level=error:pools=auto" \
+            -c:a copy \
+            -movflags +faststart \
+            -threads 0 \
+            -progress "$PROG" \
+            -loglevel error \
+            -y "$OUT" &
+          FFPID=$!
+          START=$(date +%s)
+
+          # ---- live ETA display (every 10 s) ------------------------------
+          while kill -0 $FFPID 2>/dev/null; do
+            sleep 10
+            [[ ! -f "$PROG" ]] && continue
+
+            MS=$(grep '^out_time_ms=' "$PROG" | tail -1 | cut -d= -f2)
+            SX=$(grep '^speed='       "$PROG" | tail -1 | cut -d= -f2 | tr -d 'x ')
+
+            # Validate values
+            [[ -z "$MS" ]] && continue
+            MS_INT=$(echo "$MS / 1" | bc 2>/dev/null) || continue
+            [[ "$MS_INT" -le 0 ]] 2>/dev/null && continue
+            ! [[ "$SX" =~ ^[0-9]+(\.[0-9]+)?$ ]] && SX=""
+
+            CI=$(echo "$MS_INT / 1000000" | bc)   # current encoded seconds
+            PCT=$(echo "$CI * 100 / $DI" | bc)
+
+            # ETA: prefer ffmpeg's own speed= field; fallback to wall-clock
+            if [[ -n "$SX" ]] && (( $(echo "$SX > 0.001" | bc -l) )); then
+              RI=$(echo "($DI - $CI) / $SX / 1" | bc)
+            else
+              EL=$(( $(date +%s) - START ))
+              [[ $EL -le 0 || $CI -le 0 ]] && continue
+              RATIO=$(echo "scale=4; $CI / $EL" | bc)
+              RI=$(echo "($DI - $CI) / $RATIO / 1" | bc 2>/dev/null) || RI=0
+            fi
+
+            printf "⏳ %3d%%  |  encoded %02dh%02dm%02ds  |  ETA %02dh%02dm%02ds  |  speed %sx\n" \
+              "$PCT" \
+              $((CI/3600))  $(((CI%3600)/60))  $((CI%60)) \
+              $((RI/3600))  $(((RI%3600)/60))  $((RI%60)) \
+              "${SX:-?}"
+          done
+
+          wait $FFPID; RC=$?
+          rm -f "$PROG"
+          [[ $RC -ne 0 ]] && { echo "❌ ffmpeg failed (exit $RC)"; exit $RC; }
+
+          echo ""
+          echo "✅ Encode complete!"
+          printf "   Original : %s   (%s)\n" "$(du -sh "$IN"  | cut -f1)" "$IN"
+          printf "   HEVC     : %s   (%s)\n" "$(du -sh "$OUT" | cut -f1)" "$OUT"
+          echo "WORKFILE=$OUT" >> $GITHUB_ENV
+
+      # ── 6. Upload result to GoFile ─────────────────────────────────────
+      - name: Upload to GoFile
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        run: |
+          FILE="$WORKFILE"
+          FOLDER="${{ github.event.inputs.upload_folder_id }}"
+
+          echo "📡 Getting best upload server…"
+          SERVER=$(curl -sf https://api.gofile.io/servers \
+            | jq -r '.data.servers[0].name')
+          echo "Server: $SERVER"
+          echo "Uploading: $(du -sh "$FILE" | cut -f1)  →  $FILE"
+
+          ARGS=(-F "token=${GOFILE_TOKEN}" -F "file=@${FILE}")
+          [[ -n "$FOLDER" ]] && ARGS+=(-F "folderId=${FOLDER}")
+
+          RESP=$(curl -sf "https://${SERVER}.gofile.io/contents/uploadFile" \
+            "${ARGS[@]}" --progress-bar)
+
+          if [[ "$(echo "$RESP" | jq -r '.status')" == "ok" ]]; then
+            PARENT=$(echo "$RESP" | jq -r '.data.parentFolder')
+            echo ""
+            echo "✅ Upload complete!"
+            echo "🔗 GoFile link: https://gofile.io/d/${PARENT}"
+          else
+            echo "❌ Upload failed: $RESP"
+            exit 1
+          fi
